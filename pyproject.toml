@@ -1,0 +1,10 @@
+[project]
+name = "machine-learning-system-for-sales-forecasting-in-rossmann-retail-using-historical-sales-data"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dvc>=3.67.1",
+    "dvc-gdrive>=3.0.1",
+]
