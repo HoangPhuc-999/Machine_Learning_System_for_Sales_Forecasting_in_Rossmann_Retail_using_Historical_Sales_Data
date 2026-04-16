@@ -14,18 +14,25 @@ concurrency:
   group: rossmann-mlops-pipeline
   cancel-in-progress: false
 
+env:
+  CONFIG_PATH: configs/config.yaml
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+  MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+
 jobs:
-  train-and-monitor:
+  # Job 1: Data Processing - Pull and prepare data
+  data-processing:
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
 
-    env:
-      CONFIG_PATH: configs/config.yaml
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+    outputs:
+      data-hash: ${{ steps.data-hash.outputs.hash }}
 
     steps:
       - name: Checkout repository
@@ -55,36 +62,143 @@ jobs:
           test -f data/store.csv || (echo "Missing data/store.csv. Configure DVC access or commit sample data." && exit 1)
           test -f data/test.csv || (echo "Missing data/test.csv. Configure DVC access or commit sample data." && exit 1)
 
-      - name: Run training pipeline
+      - name: Generate data hash for artifact naming
+        id: data-hash
+        run: |
+          HASH=$(cat data/train.csv data/store.csv data/test.csv | md5sum | cut -d' ' -f1 | head -c 8)
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+
+      - name: Upload data artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-data-${{ steps.data-hash.outputs.hash }}
+          path: |
+            data/train.csv
+            data/store.csv
+            data/test.csv
+          retention-days: 1
+
+  # Job 2: Model Training - Train model using processed data
+  model-training:
+    needs: data-processing
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      model-version: ${{ steps.train.outputs.model-version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install -r requirements.txt
+          pip install mlflow
+
+      - name: Download processed data
+        uses: actions/download-artifact@v4
+        with:
+          name: processed-data-${{ needs.data-processing.outputs.data-hash }}
+          path: data/
+
+      - name: Run training pipeline with MLflow tracking
+        id: train
         run: |
           python scripts/run_pipeline.py --config ${CONFIG_PATH}
+          
+          # Extract model version from MLflow or artifacts
+          MODEL_VERSION=$(date +%s)
+          echo "model-version=$MODEL_VERSION" >> $GITHUB_OUTPUT
 
-      - name: Run monitoring
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts-${{ github.sha }}
+          path: |
+            artifacts/**
+            mlruns/**
+          retention-days: 7
+
+  # Job 3: Monitoring & Evaluation - Validate model performance
+  monitoring-and-evaluation:
+    needs: [data-processing, model-training]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install -r requirements.txt
+          pip install mlflow
+
+      - name: Download processed data
+        uses: actions/download-artifact@v4
+        with:
+          name: processed-data-${{ needs.data-processing.outputs.data-hash }}
+          path: data/
+
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts-${{ github.sha }}
+          path: ./
+
+      - name: Run monitoring with MLflow logging
         run: |
           python scripts/monitor.py --reference data/train.csv --current data/test.csv --config ${CONFIG_PATH}
 
-      - name: Upload model and logs artifacts
+      - name: Upload monitoring and evaluation results
         uses: actions/upload-artifact@v4
         with:
-          name: rossmann-mlops-artifacts
+          name: monitoring-results-${{ github.sha }}
           path: |
             artifacts/**
             logs/**
-          if-no-files-found: warn
+            mlruns/**
+          retention-days: 30
 
+  # Job 4: Build and Publish Docker image (Multi-platform)
   build-and-publish:
-    needs: train-and-monitor
+    needs: monitoring-and-evaluation
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'pull_request' }}
+
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download training artifacts
+      - name: Download monitoring results
         uses: actions/download-artifact@v4
         with:
-          name: rossmann-mlops-artifacts
+          name: monitoring-results-${{ github.sha }}
           path: .
 
       - name: Set up Docker Buildx
@@ -97,18 +211,53 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Log in to GitHub Container Registry
+        if: ${{ secrets.GITHUB_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          echo "version=$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          echo "git-sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image (Multi-platform)
         if: ${{ vars.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           tags: |
             docker.io/${{ vars.DOCKERHUB_USERNAME }}/rossmann-mlops:latest
             docker.io/${{ vars.DOCKERHUB_USERNAME }}/rossmann-mlops:${{ github.sha }}
+            docker.io/${{ vars.DOCKERHUB_USERNAME }}/rossmann-mlops:${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Push to GitHub Container Registry (Multi-platform)
+        if: ${{ secrets.GITHUB_TOKEN != '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Skip Docker push when credentials are missing
-        if: ${{ vars.DOCKERHUB_USERNAME == '' || secrets.DOCKERHUB_TOKEN == '' }}
+        if: ${{ (vars.DOCKERHUB_USERNAME == '' || secrets.DOCKERHUB_TOKEN == '') && secrets.GITHUB_TOKEN == '' }}
         run: |
-          echo "DOCKERHUB_USERNAME variable or DOCKERHUB_TOKEN secret is missing. Docker push skipped."
+          echo "Docker credentials missing. Push skipped."
+          echo "Set DOCKERHUB_USERNAME var and DOCKERHUB_TOKEN secret for Docker Hub push"
+          echo "Or configure GitHub Container Registry credentials"
