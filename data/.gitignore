@@ -1,3 +1,4 @@
-/train.csv
-/store.csv
-/test.csv
+raw/*.csv
+processed/*.csvgit add data/.gitignore
+git commit -m "Fix gitignore path"
+git push
