@@ -1,0 +1,50 @@
+schema: '2.0'
+stages:
+  train:
+    cmd: python scripts/run_pipeline.py --config configs/config.yaml
+    deps:
+    - path: configs/config.yaml
+      hash: md5
+      md5: 7383b9e31dff38b7cb404696099313b3
+      size: 653
+    - path: data/raw/store.csv
+      hash: md5
+      md5: c14bfb90b2537db09dbb2b8ef4697f17
+      size: 46126
+    - path: data/raw/train.csv
+      hash: md5
+      md5: b7d92d5392ab95be0022169f67780de2
+      size: 39075162
+    - path: scripts/run_pipeline.py
+      hash: md5
+      md5: 611c85c7f4e797875c3e85c72be3d42d
+      size: 619
+    - path: src/rossmann_mlops/config.py
+      hash: md5
+      md5: 2edc53ce2893a83c393374196cb731bf
+      size: 1243
+    - path: src/rossmann_mlops/features.py
+      hash: md5
+      md5: 154100e5f447ddf34f36e21f63a5ed2f
+      size: 7839
+    - path: src/rossmann_mlops/train_model.py
+      hash: md5
+      md5: 09847df9830394ed4924ee1c78f3717c
+      size: 6007
+    params:
+      configs/config.yaml:
+        paths.model_file: artifacts/models/rossmann_model.joblib
+        paths.store_data: data/raw/store.csv
+        paths.train_data: data/raw/train.csv
+        training.n_estimators: 50
+        training.n_jobs: -1
+        training.random_state: 42
+    outs:
+    - path: artifacts/metrics/metrics.json
+      hash: md5
+      md5: 1cb3190409568ca7c776846aa903ff95
+      size: 92
+    - path: artifacts/models/rossmann_model.joblib
+      hash: md5
+      md5: 25d439ee2614d3c7da0c10616107eef4
+      size: 3578793073
