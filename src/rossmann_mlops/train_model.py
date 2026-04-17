@@ -11,9 +11,7 @@ from sklearn.linear_model import LinearRegression
 import yaml
 import logging
 import os
-import platform
-import sklearn
-from mlflow.tracking import MlflowClient
+import matplotlib.pyplot as plt
 
 # -----------------------------
 # 1. Cấu hình Logging & Metrics
@@ -22,218 +20,124 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def rmspe(y_true, y_pred):
-    """Tính toán RMSPE cho bài toán Rossmann"""
+    """Tính toán RMSPE (Metric chính của Rossmann)"""
     return np.sqrt(np.mean(((y_true - y_pred) / y_true)**2))
 
 # -----------------------------
-# 2. Khởi tạo mô hình (Factory Pattern)
+# 2. Feature Engineering Logic (Khớp với Notebook)
 # -----------------------------
-def get_model_instance(name, params):
-    model_map = {
-        'LinearRegression': LinearRegression,
-        'XGBoost': xgb.XGBRegressor,
-        'LightGBM': lgb.LGBMRegressor,
-        'CatBoost': CatBoostRegressor
-    }
-    if name not in model_map:
-        raise ValueError(f"Mô hình không hỗ trợ: {name}")
-    return model_map[name](**params)
-
-# -----------------------------
-# 3. Pipeline Function (for run_pipeline.py)
-# -----------------------------
-def train_pipeline(config):
-    """
-    Main training pipeline function that accepts config dict
-    """
-    # Extract config values with defaults
-    training_cfg = config.get('training', {})
-    paths_cfg = config.get('paths', {})
+def apply_feature_engineering(train_set, val_set):
+    logger.info("Đang tính toán các biến trung bình (Target Encoding)...")
     
-    model_name = 'XGBoost'
-    model_params = {
-        'n_estimators': training_cfg.get('n_estimators', 300),
-        'random_state': training_cfg.get('random_state', 42),
-    }
-    
-    train_data_path = paths_cfg.get('train_data', 'data/train.csv')
-    store_data_path = paths_cfg.get('store_data', 'data/store.csv')
-    model_save_path = paths_cfg.get('model_file', 'artifacts/models/rossmann_model.joblib')
-    models_dir = os.path.dirname(model_save_path)
+    # Tính trung bình Sales_log theo Store, Thứ và Promo trên tập TRAIN
+    store_dw_promo_avg = train_set.groupby(['Store', 'DayOfWeek', 'Promo'])['Sales_log'].mean().reset_index()
+    store_dw_promo_avg.rename(columns={'Sales_log': 'Store_DW_Promo_Avg'}, inplace=True)
 
-    # Setup MLflow
-    mlflow_uri = os.environ.get('MLFLOW_TRACKING_URI', 'http://127.0.0.1:5000')
-    if mlflow_uri:
-        mlflow.set_tracking_uri(mlflow_uri)
-        mlflow.set_experiment("Rossmann_Final_Training")
+    # Tính trung bình Sales_log theo Tháng
+    month_avg = train_set.groupby('Month')['Sales_log'].mean().reset_index()
+    month_avg.rename(columns={'Sales_log': 'Month_Avg_Sales'}, inplace=True)
 
-    # Load data
-    logger.info(f"Đang tải dữ liệu từ: {train_data_path}")
-    try:
-        df = pd.read_csv(train_data_path)
-    except FileNotFoundError:
-        logger.error(f"File not found: {train_data_path}")
-        return {'status': 'error', 'message': f'File not found: {train_data_path}'}
-    
-    # Time-based split (assuming columns exist)
-    if 'Year' in df.columns and 'WeekOfYear' in df.columns:
-        val_condition = (df['Year'] == 2015) & (df['WeekOfYear'] >= 26)
-    else:
-        # Fallback to simple split if columns don't exist
-        val_condition = df.index >= int(len(df) * 0.8)
-    
-    train_df = df[~val_condition].copy()
-    val_df = df[val_condition].copy()
+    # Merge vào các tập dữ liệu
+    train_set = train_set.merge(store_dw_promo_avg, on=['Store', 'DayOfWeek', 'Promo'], how='left')
+    train_set = train_set.merge(month_avg, on='Month', how='left')
 
-    # Tách feature/target
-    drop_cols = ['Sales', 'Sales_log', 'Customers']
-    X_train = train_df.drop(columns=[c for c in drop_cols if c in train_df.columns], errors='ignore')
-    y_train = train_df['Sales'] if 'Sales' in train_df.columns else train_df.iloc[:, -1]
-    
-    X_val = val_df.drop(columns=[c for c in drop_cols if c in val_df.columns], errors='ignore')
-    y_val_orig = val_df['Sales'] if 'Sales' in val_df.columns else val_df.iloc[:, -1]
+    val_set = val_set.merge(store_dw_promo_avg, on=['Store', 'DayOfWeek', 'Promo'], how='left')
+    val_set = val_set.merge(month_avg, on='Month', how='left')
 
-    # Get model
-    model = get_model_instance(model_name, model_params)
+    # Xử lý NaN bằng global mean của tập Train
+    global_mean_train = train_set['Sales_log'].mean()
+    val_set['Store_DW_Promo_Avg'] = val_set['Store_DW_Promo_Avg'].fillna(global_mean_train)
+    val_set['Month_Avg_Sales'] = val_set['Month_Avg_Sales'].fillna(global_mean_train)
 
-    # Training with MLflow
-    try:
-        with mlflow.start_run(run_name="final_production_training"):
-            logger.info(f"🚀 Đang huấn luyện: {model_name}")
-            model.fit(X_train, y_train)
-            
-            # Predict & Calculate RMSPE
-            y_pred = model.predict(X_val)
-            val_rmspe = float(rmspe(y_val_orig, y_pred)) if len(y_val_orig) > 0 else 0.0
-
-            # Log metrics
-            mlflow.log_params(model_params)
-            mlflow.log_metric('val_rmspe', val_rmspe)
-
-            # Save model locally
-            os.makedirs(models_dir, exist_ok=True)
-            joblib.dump(model, model_save_path)
-            
-            result = {
-                'status': 'success',
-                'model_path': model_save_path,
-                'val_rmspe': val_rmspe,
-                'message': f"Model trained and saved: {model_save_path}"
-            }
-            
-            logger.info(f"✅ Hoàn tất! RMSPE: {val_rmspe:.4f}")
-            return result
-    except Exception as e:
-        logger.error(f"Training failed: {str(e)}")
-        return {'status': 'error', 'message': str(e)}
+    return train_set, val_set
 
 # -----------------------------
-# 4. Luồng xử lý chính
+# 3. Luồng huấn luyện chính
 # -----------------------------
 def main(args):
-    # Load config
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
-    model_cfg = config['best_model'] # Lưu ý: File config Đa lưu ở cell trước có key 'best_model'
-
     # Setup MLflow
-    if args.mlflow_uri:
-        mlflow.set_tracking_uri(args.mlflow_uri)
-        mlflow.set_experiment("Rossmann_Final_Training")
+    mlflow.set_tracking_uri(args.mlflow_uri)
+    mlflow.set_experiment("Rossmann_Final_Training")
 
-    # Load data
+    # 1. Load data
     logger.info(f"Đang tải dữ liệu từ: {args.data}")
     df = pd.read_csv(args.data)
     
-    # Time-based split (Logic đặc thù cho Rossmann của Đa)
+    # 2. Split data theo thời gian (6 tuần cuối 2015)
     val_condition = (df['Year'] == 2015) & (df['WeekOfYear'] >= 26)
     train_df = df[~val_condition].copy()
     val_df = df[val_condition].copy()
 
-    # Tách feature/target (Tránh Leakage)
-    drop_cols = ['Sales', 'Sales_log', 'Customers']
+    # 3. Feature Engineering
+    train_df, val_df = apply_feature_engineering(train_df, val_df)
+
+    # 4. Chuẩn bị X, y (Huấn luyện trên Sales_log)
+    drop_cols = ['Sales', 'Sales_log', 'Customers', 'Month', 'Promo2']
     X_train = train_df.drop(columns=drop_cols, errors='ignore')
     y_train = train_df['Sales_log']
     
     X_val = val_df.drop(columns=drop_cols, errors='ignore')
-    y_val_orig = np.exp(val_df['Sales_log']) # Giá trị thực tế để tính RMSPE
+    y_val_orig = np.exp(val_df['Sales_log']) # Giá trị gốc để tính RMSPE
 
-    # Get model
-    model = get_model_instance(model_cfg['name'], model_cfg['params'])
+    # 5. Khởi tạo Model (Mặc định dùng XGBoost theo best params của bạn)
+    # Bạn có thể điều chỉnh params này theo kết quả Optuna/GridSearch
+    model = xgb.XGBRegressor(
+        objective='reg:squarederror',
+        tree_method='hist',
+        n_estimators=1000,
+        max_depth=11,
+        learning_rate=0.025,
+        random_state=42
+    )
 
-    # Start MLflow run
-    with mlflow.start_run(run_name="final_production_training"):
-        logger.info(f"🚀 Đang huấn luyện: {model_cfg['name']}")
+    with mlflow.start_run(run_name="Production_Train_Logic"):
+        logger.info("🚀 Đang huấn luyện mô hình...")
         model.fit(X_train, y_train)
         
-        # Dự đoán & Tính RMSPE
-        y_pred_log = model.predict(X_val)
-        y_pred_orig = np.exp(y_pred_log)
-        val_rmspe = float(rmspe(y_val_orig, y_pred_orig))
+        # 6. Dự đoán và tính toán Metric
+        y_train_pred = np.exp(model.predict(X_train))
+        y_val_pred = np.exp(model.predict(X_val))
 
-        # Log params và metrics (Cập nhật sang RMSPE)
-        mlflow.log_params(model_cfg['params'])
-        mlflow.log_metric('val_rmspe', val_rmspe)
+        train_rmspe = rmspe(np.exp(y_train), y_train_pred)
+        val_rmspe = rmspe(y_val_orig, y_val_pred)
+        rmspe_gap = val_rmspe - train_rmspe
 
-        # Đăng ký Model vào Registry (Theo chuẩn Skeleton)
-        mlflow.sklearn.log_model(model, "production_model")
-        reg_model_name = "Rossmann_Sales_Model" # Tên định danh chung của nhóm
-        model_uri = f"runs:/{mlflow.active_run().info.run_id}/production_model"
+        # 7. Log MLflow
+        mlflow.log_params(model.get_params())
+        mlflow.log_metric("train_rmspe", train_rmspe)
+        mlflow.log_metric("val_rmspe", val_rmspe)
+        mlflow.log_metric("rmspe_gap", rmspe_gap)
 
-        logger.info("Đang đăng ký mô hình vào MLflow Registry...")
-        client = MlflowClient()
-        try:
-            client.create_registered_model(reg_model_name)
-        except:
-            pass # Đã tồn tại
-
-        model_version = client.create_model_version(
-            name=reg_model_name,
-            source=model_uri,
-            run_id=mlflow.active_run().info.run_id
-        )
-
-        # Chuyển sang Staging
-        client.transition_model_version_stage(
-            name=reg_model_name,
-            version=model_version.version,
-            stage="Staging"
-        )
-
-        # Cập nhật Description & Tags chi tiết
-        description = (
-            f"Mô hình dự báo doanh số Rossmann.\n"
-            f"Thuật toán: {model_cfg['name']}\n"
-            f"RMSPE trên tập 6 tuần cuối: {val_rmspe:.4f}"
-        )
-        client.update_registered_model(name=reg_model_name, description=description)
+        # 8. Xuất file model .joblib (Để gửi cho Phúc)
+        os.makedirs(args.artifacts_dir, exist_ok=True)
+        model_path = os.path.join(args.artifacts_dir, "rossmann_model.joblib")
+        joblib.dump(model, model_path)
         
-        # Thêm các thẻ phụ (Tags) giúp tra cứu nhanh
-        tags = {
-            "algorithm": model_cfg['name'],
-            "python_version": platform.python_version(),
-            "sklearn_version": sklearn.__version__,
-            "training_date": pd.Timestamp.now().strftime("%Y-%m-%d")
+        # Log model lên MLflow
+        mlflow.sklearn.log_model(model, "model")
+
+        # 9. Lưu file Config .yaml
+        config_path = '../configs/model_config.yaml'
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        model_config = {
+            'project': 'Rossmann Store Sales',
+            'best_model': {
+                'name': 'XGBoost',
+                'val_rmspe': float(val_rmspe),
+                'params': model.get_params()
+            },
+            'features': {'input_columns': list(X_train.columns)}
         }
-        for k, v in tags.items():
-            client.set_registered_model_tag(reg_model_name, k, v)
+        with open(config_path, 'w') as f:
+            yaml.dump(model_config, f)
 
-        # Lưu model cục bộ (pkl)
-        os.makedirs(args.models_dir, exist_ok=True)
-        save_path = os.path.join(args.models_dir, "rossmann_best_model.pkl")
-        joblib.dump(model, save_path)
-        
-        logger.info(f"✅ Hoàn tất! Model saved: {save_path} | RMSPE: {val_rmspe:.4f}")
+        logger.info(f"✅ Hoàn tất! Model: {model_path} | Val RMSPE: {val_rmspe:.4f}")
 
-# -----------------------------
-# 4. Cấu hình Argument Parser
-# -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Đường dẫn file model_config.yaml")
-    parser.add_argument("--data", type=str, required=True, help="Đường dẫn file dữ liệu CSV đã featured")
-    parser.add_argument("--models-dir", type=str, default="../models/trained", help="Thư mục lưu model")
-    parser.add_argument("--mlflow-uri", type=str, default="http://127.0.0.1:5000", help="MLflow Server URI")
+    parser.add_argument("--data", type=str, default="../data/processed/train_final.csv")
+    parser.add_argument("--artifacts-dir", type=str, default="../artifacts/models")
+    parser.add_argument("--mlflow-uri", type=str, default="http://127.0.0.1:5000")
     
     args = parser.parse_args()
     main(args)

@@ -5,35 +5,27 @@ best_model:
     gamma: 0.00023429788475798095
     learning_rate: 0.02484904299575523
     max_depth: 11
-    min_child_weight: 20
+    min_child_weight: 15
     n_estimators: 1000
     subsample: 0.8437880308889292
-  train_rmspe: 0.11851174093333407
-  val_rmspe: 0.12028826637185551
+  rmspe: 0.11997311230570923
 features:
   input_columns:
   - Store
   - DayOfWeek
   - Promo
+  - StateHoliday
+  - SchoolHoliday
+  - StoreType
+  - Assortment
   - CompetitionDistance_log
   - Year
   - Day
   - WeekOfYear
-  - Promo2OpenWeeks
-  - promo_holiday
-  - competition_open_months
-  - competition_impact
-  - StoreType_b
-  - StoreType_c
-  - StoreType_d
-  - Assortment_b
-  - Assortment_c
-  - Store_Avg_Sales
-  - Promo_Lift
-  - Store_DoW_Median
-  - day_sin
-  - day_cos
-  - week_sin
-  - week_cos
+  - Promo2Open_Month
+  - CompetitionOpen_Month
+  - Is_Promo2_Month
+  - Store_DW_Promo_Avg
+  - Month_Avg_Sales
   target: Sales_log
 project: Rossmann Store Sales
