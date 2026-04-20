@@ -158,19 +158,21 @@ TEST_DATE_MAX = date(2015, 9, 17)
 
 @st.cache_data
 def load_holiday_lookup() -> dict:
-    """Load Open/StateHoliday/SchoolHoliday from the raw test CSV keyed by (Store, Date).
+    """Load Open/StateHoliday/SchoolHoliday from the processed test CSV keyed by (Store, Date).
     Falls back to date-only lookup for StateHoliday/SchoolHoliday when Store not found.
     Returns empty dict when the file has not been pulled yet."""
     data_path = os.path.join(os.path.dirname(__file__), "..", "data", "raw", "test.csv")
     try:
         df = pd.read_csv(data_path, usecols=["Store", "Date", "Open", "StateHoliday", "SchoolHoliday"])
         df["StateHoliday"] = df["StateHoliday"].astype(str).replace({"nan": "0"})
+        # Normalize Date to YYYY-MM-DD string regardless of CSV format
         df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
         df["Store"] = df["Store"].astype(int)
-        # Open có NaN trong Kaggle test (store đóng cửa) → fill 0
-        df["Open"] = df["Open"].fillna(0).astype(int)
+        # Open có NaN trong Kaggle test (store đóng cửa không có doanh số) → fill 0
+        df["Open"] = df["Open"].fillna(1).astype(int)
         df["SchoolHoliday"] = df["SchoolHoliday"].fillna(0).astype(int)
         # Primary lookup: (Store, Date) → full info including Open
+        # Use itertuples to ensure Python native int keys (avoid numpy.int64 mismatch)
         store_date = {
             (int(row.Store), str(row.Date)): {
                 "Open": int(row.Open),
@@ -179,7 +181,7 @@ def load_holiday_lookup() -> dict:
             }
             for row in df.itertuples(index=False)
         }
-        # Fallback lookup: Date → holiday info (date-level)
+        # Fallback lookup: Date → holiday info (date-level, deduplicated)
         date_only = df.drop_duplicates("Date").set_index("Date")[["StateHoliday", "SchoolHoliday"]]
         return {"store_date": store_date, "date_only": date_only.to_dict("index")}
     except Exception:
@@ -364,6 +366,7 @@ if page == "🏠  Dashboard":
                 with st.spinner("Forecasting…"):
                     preds = call_predict(records)
                 if preds:
+                    # Stores closed (Open=0) → force 0 in chart
                     preds = [p if records[i]["Open"] == 1 else 0.0 for i, p in enumerate(preds)]
                     days = [(demo_start + timedelta(days=i)).isoformat() for i in range(7)]
                     df_demo = pd.DataFrame({"Date": days, "Predicted Sales (€)": preds})
@@ -421,6 +424,9 @@ elif page == "🔮  Single Prediction":
         else:
             day_of_week = pred_date.isoweekday()
             date_str = pred_date.isoformat()
+
+            # Look up per-store Open status from actual test data
+            # Cast store to int: st.number_input returns float (e.g. 1.0) which won't match int key
             store_key = int(store)
             store_date_lookup = holiday_lookup.get("store_date", {})
             date_only_lookup = holiday_lookup.get("date_only", {})
@@ -428,16 +434,11 @@ elif page == "🔮  Single Prediction":
             date_info = date_only_lookup.get(date_str, {})
 
             if store_info:
-                open_ = int(store_info.get("Open", 1))
+                open_ = int(store_info.get("Open", 0 if day_of_week == 7 else 1))
                 state_holiday = str(store_info.get("StateHoliday", "0"))
                 school_holiday = int(store_info.get("SchoolHoliday", 0))
             else:
-                store_in_test = store_key in {k[0] for k in store_date_lookup.keys()}
-                if not store_in_test:
-                    st.warning(
-                        f"⚠️ Store **{store_key}** is not in the Kaggle test dataset (only 856 out of 1,115 stores). "
-                        "Prediction will use default assumptions (open, no special holiday)."
-                    )
+                # Fallback khi store không có trong test data: mặc định mở cửa
                 open_ = 1
                 state_holiday = str(date_info.get("StateHoliday", "0"))
                 school_holiday = int(date_info.get("SchoolHoliday", 0))
@@ -460,6 +461,7 @@ elif page == "🔮  Single Prediction":
             res_col, info_col = st.columns([1, 1.3], gap="large")
 
             if open_ == 0:
+                # Store đóng cửa → không gọi API, trả sales = 0
                 with res_col:
                     st.markdown(
                         f"""
@@ -474,6 +476,7 @@ elif page == "🔮  Single Prediction":
                 with info_col:
                     st.info("🔒 This store is **closed** on this date according to the test data. Sales = 0.")
             else:
+                # Store mở cửa → gọi API dự báo
                 with st.spinner("Running prediction…"):
                     preds = call_predict([record])
                 if preds:
@@ -631,6 +634,7 @@ elif page == "📦  Batch Prediction":
                     preds = call_predict(records)
 
                 if preds:
+                    # Force 0 for closed stores
                     preds = [p if records[i]["Open"] == 1 else 0.0 for i, p in enumerate(preds)]
                     df_gen = pd.DataFrame(records)
                     df_gen["Predicted_Sales"] = preds
