@@ -1,5 +1,18 @@
 # ──────────────────────────────────────────────
-# Stage 3: streamlit — image chạy Streamlit UI
+# Stage 1: builder — cài deps vào /install
+# ──────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /install
+
+COPY requirements.txt .
+RUN pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+# ──────────────────────────────────────────────
+# Stage 2: streamlit — image chạy Streamlit UI
 # ──────────────────────────────────────────────
 FROM python:3.11-slim AS streamlit
 

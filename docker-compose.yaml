@@ -2,7 +2,7 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.api
       target: api          # chỉ build stage api
     container_name: rossmann_api
     ports:
@@ -22,7 +22,7 @@ services:
   streamlit:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.streamlit
       target: streamlit    # chỉ build stage streamlit
     container_name: rossmann_streamlit
     ports:

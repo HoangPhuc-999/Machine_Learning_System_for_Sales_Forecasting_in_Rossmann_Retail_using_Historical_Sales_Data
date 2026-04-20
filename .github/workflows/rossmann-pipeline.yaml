@@ -150,61 +150,61 @@ jobs:
           MODEL_VERSION=$(date +%s)
           echo "model-version=$MODEL_VERSION" >> $GITHUB_OUTPUT
 
-          - name: Evaluate quality gate for model promotion
-          id: promotion-gate
-          run: |
-            python - <<'PY'
-            import json
-            import os
-            from pathlib import Path
+      - name: Evaluate quality gate for model promotion
+        id: promotion-gate
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-            candidate_path = Path("artifacts/metrics/metrics.json")
-            baseline_path = Path("artifacts/metrics/metrics_baseline.json")
+          candidate_path = Path("artifacts/metrics/metrics.json")
+          baseline_path = Path("artifacts/metrics/metrics_baseline.json")
 
-            if not candidate_path.exists():
-              raise SystemExit(f"Candidate metrics not found: {candidate_path}")
+          if not candidate_path.exists():
+            raise SystemExit(f"Candidate metrics not found: {candidate_path}")
 
-            candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-            baseline = None
-            if baseline_path.exists():
-              baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+          candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+          baseline = None
+          if baseline_path.exists():
+            baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
 
-            chosen_metric = None
-            for metric_name in ("val_rmspe", "rmse"):
-              if metric_name in candidate and (baseline is None or metric_name in baseline):
-                chosen_metric = metric_name
-                break
+          chosen_metric = None
+          for metric_name in ("val_rmspe", "rmse"):
+            if metric_name in candidate and (baseline is None or metric_name in baseline):
+              chosen_metric = metric_name
+              break
 
-            if chosen_metric is None:
-              if baseline is None:
-                should_promote = True
-                reason = "no_baseline_metrics"
-                chosen_metric = "none"
-              else:
-                should_promote = False
-                reason = "missing_comparable_metric"
-                chosen_metric = "none"
-            elif baseline is None:
+          if chosen_metric is None:
+            if baseline is None:
               should_promote = True
-              reason = f"no_baseline_{chosen_metric}"
+              reason = "no_baseline_metrics"
+              chosen_metric = "none"
             else:
-              candidate_value = float(candidate[chosen_metric])
-              baseline_value = float(baseline[chosen_metric])
-              should_promote = candidate_value < baseline_value
-              if should_promote:
-                reason = f"improved_{chosen_metric}:{candidate_value:.6f}<{baseline_value:.6f}"
-              else:
-                reason = f"not_improved_{chosen_metric}:{candidate_value:.6f}>={baseline_value:.6f}"
+              should_promote = False
+              reason = "missing_comparable_metric"
+              chosen_metric = "none"
+          elif baseline is None:
+            should_promote = True
+            reason = f"no_baseline_{chosen_metric}"
+          else:
+            candidate_value = float(candidate[chosen_metric])
+            baseline_value = float(baseline[chosen_metric])
+            should_promote = candidate_value < baseline_value
+            if should_promote:
+              reason = f"improved_{chosen_metric}:{candidate_value:.6f}<{baseline_value:.6f}"
+            else:
+              reason = f"not_improved_{chosen_metric}:{candidate_value:.6f}>={baseline_value:.6f}"
 
-            with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as out:
-              out.write(f"should-promote={'true' if should_promote else 'false'}\n")
-              out.write(f"promotion-reason={reason}\n")
-              out.write(f"promotion-metric={chosen_metric}\n")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as out:
+            out.write(f"should-promote={'true' if should_promote else 'false'}\n")
+            out.write(f"promotion-reason={reason}\n")
+            out.write(f"promotion-metric={chosen_metric}\n")
 
-            print(f"should_promote={should_promote}")
-            print(f"reason={reason}")
-            print(f"metric={chosen_metric}")
-            PY
+          print(f"should_promote={should_promote}")
+          print(f"reason={reason}")
+          print(f"metric={chosen_metric}")
+          PY
 
       - name: Upload model artifacts
         uses: actions/upload-artifact@v4
@@ -436,6 +436,19 @@ jobs:
           name: monitoring-results-${{ github.sha }}
           path: .
 
+      - name: Download processed data
+        uses: actions/download-artifact@v4
+        with:
+          name: processed-data-${{ needs.data-processing.outputs.data-hash }}
+          path: .
+
+      - name: Normalize downloaded data layout for image build
+        run: |
+          mkdir -p data/raw
+          [ -f train.csv ] && [ ! -f data/raw/train.csv ] && mv train.csv data/raw/train.csv || true
+          [ -f store.csv ] && [ ! -f data/raw/store.csv ] && mv store.csv data/raw/store.csv || true
+          [ -f test.csv ] && [ ! -f data/raw/test.csv ] && mv test.csv data/raw/test.csv || true
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -471,7 +484,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.api
           target: api
           push: true
           platforms: linux/amd64,linux/arm64
@@ -487,7 +500,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.streamlit
           target: streamlit
           push: true
           platforms: linux/amd64,linux/arm64
@@ -503,7 +516,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.api
           target: api
           push: true
           platforms: linux/amd64,linux/arm64
@@ -519,7 +532,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.streamlit
           target: streamlit
           push: true
           platforms: linux/amd64,linux/arm64

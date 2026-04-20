@@ -67,11 +67,18 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Prepare API image build context
+        run: |
+          mkdir -p artifacts/models data/raw
+          if [ ! -f data/raw/store.csv ]; then
+            printf 'Store,StoreType,Assortment,CompetitionDistance,Promo2,Promo2SinceWeek,Promo2SinceYear,CompetitionOpenSinceMonth,CompetitionOpenSinceYear,PromoInterval\n' > data/raw/store.csv
+          fi
+
       - name: Build API image (Multi-platform - no push)
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.api
           target: api
           push: false
           platforms: linux/amd64,linux/arm64
@@ -83,7 +90,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.streamlit
           target: streamlit
           push: false
           platforms: linux/amd64,linux/arm64
