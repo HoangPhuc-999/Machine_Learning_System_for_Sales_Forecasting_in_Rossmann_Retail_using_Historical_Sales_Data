@@ -24,16 +24,20 @@ def test_train_pipeline_smoke(tmp_path: Path, monkeypatch) -> None:
     processed_dir.mkdir(parents=True)
 
     train_df = pd.DataFrame({
-        "Store": [1, 1, 1, 2, 2, 2],
-        "DayOfWeek": [1, 2, 3, 1, 2, 3],
-        "Date": ["2015-05-20", "2015-05-21", "2015-06-20",
-                 "2015-05-20", "2015-05-21", "2015-06-20"],
-        "Open": [1, 1, 1, 1, 1, 1],
-        "Promo": [0, 1, 1, 0, 1, 1],
-        "StateHoliday": ["0", "0", "0", "0", "0", "0"],
-        "SchoolHoliday": [0, 0, 1, 0, 0, 1],
-        "Sales": [5000, 5200, 5500, 3000, 3200, 3600],
-    })
+    "Store": [1, 1, 1, 2, 2, 2, 1, 1, 2, 2],
+    "DayOfWeek": [1, 2, 3, 1, 2, 3, 1, 2, 1, 2],
+    "Date": [
+        "2015-05-20", "2015-05-21", "2015-06-20",  # train split
+        "2015-05-20", "2015-05-21", "2015-06-20",  # train split
+        "2015-07-01", "2015-07-02",                 # val split (week >= 26)
+        "2015-07-01", "2015-07-02",                 # val split (week >= 26)
+    ],
+    "Open": [1] * 10,
+    "Promo": [0, 1, 1, 0, 1, 1, 0, 1, 0, 1],
+    "StateHoliday": ["0"] * 10,
+    "SchoolHoliday": [0, 0, 1, 0, 0, 1, 0, 0, 0, 0],
+    "Sales": [5000, 5200, 5500, 3000, 3200, 3600, 5100, 5300, 3100, 3300],
+})
     store_df = pd.DataFrame({
         "Store": [1, 2],
         "StoreType": ["a", "b"],

@@ -36,10 +36,6 @@ def rmspe(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def _load_processed_data(
     paths: dict[str, Any],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Load preprocessed train_final and val_final datasets.
-    These files are expected to already have all preprocessing and feature engineering applied.
-    """
     train_path = resolve_path(paths.get("train_final_data", "data/processed/train_final.csv"))
     val_path = resolve_path(paths.get("val_final_data", "data/processed/val_final.csv"))
 
@@ -49,7 +45,11 @@ def _load_processed_data(
         raise FileNotFoundError(f"Preprocessed validation data not found: {val_path}")
 
     train_df = pd.read_csv(train_path)
-    val_df = pd.read_csv(val_path)
+    val_df   = pd.read_csv(val_path)
+
+    # Ép kiểu numeric để XGBoost không báo lỗi dtype object
+    train_df = train_df.apply(pd.to_numeric, errors="ignore")
+    val_df   = val_df.apply(pd.to_numeric, errors="ignore")
 
     logger.info(f"Loaded training data: {len(train_df)} rows from {train_path}")
     logger.info(f"Loaded validation data: {len(val_df)} rows from {val_path}")
