@@ -20,6 +20,9 @@ dependencies = [
     "dvc>=3.67.1",
     "dvc-s3>=3.3.0",
     "prometheus-client>=0.21.0",
+    "streamlit>=1.35.0",
+    "plotly>=5.22.0",
+    "requests>=2.32.0",
 ]
 
 [project.optional-dependencies]

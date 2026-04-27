@@ -33,9 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
           pip install -e .[dev]
-          pip install -r requirements.txt
 
       - name: Validate package import and config
         run: |
@@ -81,7 +79,7 @@ jobs:
           file: ./Dockerfile.api
           target: api
           push: false
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: rossmann-mlops-api:ci-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -93,7 +91,7 @@ jobs:
           file: ./Dockerfile.streamlit
           target: streamlit
           push: false
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: rossmann-mlops-streamlit:ci-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

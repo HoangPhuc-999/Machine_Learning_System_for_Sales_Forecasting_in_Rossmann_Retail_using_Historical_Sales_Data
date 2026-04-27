@@ -6,6 +6,7 @@ on:
       - 'app/**'
       - 'src/**'
       - 'configs/**'
+      - 'pyproject.toml'
       - 'requirements.txt'
       - 'Dockerfile.api'
       - 'Dockerfile.streamlit'
@@ -54,7 +55,7 @@ jobs:
           tags: |
             docker.io/${{ vars.DOCKERHUB_USERNAME }}/rossmann-mlops-api:latest
             docker.io/${{ vars.DOCKERHUB_USERNAME }}/rossmann-mlops-api:${{ github.sha }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -68,6 +69,6 @@ jobs:
           tags: |
             docker.io/${{ vars.DOCKERHUB_USERNAME }}/rossmann-mlops-streamlit:latest
             docker.io/${{ vars.DOCKERHUB_USERNAME }}/rossmann-mlops-streamlit:${{ github.sha }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
