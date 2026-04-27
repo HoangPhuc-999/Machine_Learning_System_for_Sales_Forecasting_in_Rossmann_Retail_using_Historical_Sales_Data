@@ -134,7 +134,13 @@ jobs:
           else
             echo "No baseline metrics found. First promotion will be allowed."
           fi
-
+      - name: Run preprocessing
+        run: |
+          python scripts/run_preprocessing.py --config ${CONFIG_PATH}
+      - name: Verify processed data exists
+        run: |
+          test -f data/processed/train_final.csv || \
+            (echo "Preprocessing failed: train_final.csv not found" && exit 1)
       - name: Run training pipeline with MLflow tracking
         id: train
         run: |
