@@ -136,11 +136,13 @@ jobs:
           fi
       - name: Run preprocessing
         run: |
-          python scripts/run_preprocessing.py --config ${CONFIG_PATH}
+          python -m rossmann_mlops.processing --config ${CONFIG_PATH}
       - name: Verify processed data exists
         run: |
-          test -f data/processed/train_final.csv || \
-            (echo "Preprocessing failed: train_final.csv not found" && exit 1)
+          test -f data/processed/train_final.csv || (echo "Preprocessing failed" && exit 1)
+          test -f data/processed/val_final.csv   || (echo "val_final.csv missing" && exit 1)
+          test -f data/processed/test_final.csv  || (echo "test_final.csv missing" && exit 1)
+          echo "✅ All processed files ready"
       - name: Run training pipeline with MLflow tracking
         id: train
         run: |
