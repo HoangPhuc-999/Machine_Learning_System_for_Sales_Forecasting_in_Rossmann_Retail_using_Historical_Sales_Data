@@ -5,7 +5,6 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
-from datetime import datetime
 
 import joblib
 import mlflow
@@ -20,283 +19,42 @@ from rossmann_mlops.config import load_config, resolve_path
 
 
 class TrainingError(ValueError):
-    """Raised when training input/split/configuration is invalid."""
+    """Raised when training input/configuration is invalid."""
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-REQUIRED_TRAIN_COLUMNS = [
-    "Store",
-    "DayOfWeek",
-    "Promo",
-    "Month",
-    "Year",
-    "WeekOfYear",
-    "Sales_log",
-]
-
-
 def rmspe(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Calculate Root Mean Squared Percentage Error."""
     safe_true = np.maximum(np.asarray(y_true, dtype=float), 1e-8)
     safe_pred = np.asarray(y_pred, dtype=float)
     return float(np.sqrt(np.mean(np.square((safe_true - safe_pred) / safe_true))))
 
 
-def _ensure_required_columns(frame: pd.DataFrame, required_columns: list[str], source_name: str) -> None:
-    missing = [column for column in required_columns if column not in frame.columns]
-    if missing:
-        raise TrainingError(f"Missing required columns in {source_name}: {missing}")
-
-
-def _prepare_training_columns(train_df: pd.DataFrame) -> pd.DataFrame:
-    frame = train_df.copy()
-
-    if "Date" in frame.columns:
-        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-        frame = frame.dropna(subset=["Date"]).copy()
-        if "Year" not in frame.columns:
-            frame["Year"] = frame["Date"].dt.year
-        if "WeekOfYear" not in frame.columns:
-            frame["WeekOfYear"] = frame["Date"].dt.isocalendar().week.astype(int)
-        if "Month" not in frame.columns:
-            frame["Month"] = frame["Date"].dt.month
-        if "DayOfWeek" not in frame.columns:
-            frame["DayOfWeek"] = frame["Date"].dt.weekday + 1
-
-    # Lọc bỏ các ngày cửa hàng đóng cửa (Sales=0 / Open=0).
-    # Đây là tiêu chuẩn của cuộc thi Rossmann: RMSPE chỉ tính trên ngày mở cửa.
-    # File train_final.csv trong notebook đã được lọc sẵn ở bước preprocessing trước,
-    # nhưng train_model.py đọc dữ liệu raw nên cần lọc tại đây để tránh train RMSPE bùng nổ.
-    if "Open" in frame.columns:
-        n_before = len(frame)
-        frame = frame[frame["Open"] != 0].copy()
-        logger.info("Filtered %d closed-store rows (Open=0)", n_before - len(frame))
-
-    if "Sales" in frame.columns:
-        frame["Sales"] = pd.to_numeric(frame["Sales"], errors="coerce")
-        n_before = len(frame)
-        frame = frame[frame["Sales"] > 0].copy()
-        logger.info("Filtered %d zero-sales rows (Sales=0)", n_before - len(frame))
-
-    if "Sales_log" not in frame.columns:
-        if "Sales" not in frame.columns:
-            raise TrainingError("Training data must include either 'Sales_log' or 'Sales'")
-        # Sau khi đã lọc Sales > 0, dùng log trực tiếp (không cần floor 1.0 nữa)
-        frame["Sales_log"] = np.log(pd.to_numeric(frame["Sales"], errors="coerce"))
-
-    _ensure_required_columns(frame, REQUIRED_TRAIN_COLUMNS, "training data")
-
-    frame["Year"] = pd.to_numeric(frame["Year"], errors="coerce")
-    frame["WeekOfYear"] = pd.to_numeric(frame["WeekOfYear"], errors="coerce")
-    frame["Month"] = pd.to_numeric(frame["Month"], errors="coerce")
-    frame["DayOfWeek"] = pd.to_numeric(frame["DayOfWeek"], errors="coerce")
-    frame["Promo"] = pd.to_numeric(frame["Promo"], errors="coerce")
-    frame["Sales_log"] = pd.to_numeric(frame["Sales_log"], errors="coerce")
-
-    return frame.dropna(subset=["Year", "WeekOfYear", "Month", "DayOfWeek", "Promo", "Sales_log"]).copy()
-
-
-from sklearn.model_selection import KFold
-import pandas as pd
-import numpy as np
-
-def apply_feature_engineering(
-    train_set: pd.DataFrame,
-    val_set: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, float, dict, pd.DataFrame, dict]:
-    logger.info("Computing OOF target-encoding for Train and mapping for Val")
-
-    # Sao chép để tránh làm thay đổi dataframe gốc ngoài ý muốn
-    train_df = train_set.copy()
-    val_df = val_set.copy()
-
-    if train_df.empty:
-        raise TrainingError("Training split is empty after preprocessing")
-
-    # ------------------------------------------------------------------ #
-    # PHẦN 1: OOF TARGET ENCODING (Store_DW_Promo_Avg, Month_Avg_Sales)   #
-    # ------------------------------------------------------------------ #
-
-    # 1. KHỞI TẠO OOF (Dành riêng cho Train Set)
-    train_df['Store_DW_Promo_Avg'] = np.nan
-    train_df['Month_Avg_Sales'] = np.nan
-
-    if len(train_df) >= 2:
-        n_splits = min(5, len(train_df))
-        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-
-        for train_idx, val_idx in kf.split(train_df):
-            fold_train = train_df.iloc[train_idx]
-            fold_val = train_df.iloc[val_idx]
-
-            # Store_DW_Promo_Avg
-            group_store = fold_train.groupby(['Store', 'DayOfWeek', 'Promo'])['Sales_log'].mean()
-            train_df.loc[train_df.index[val_idx], 'Store_DW_Promo_Avg'] = (
-                fold_val.set_index(['Store', 'DayOfWeek', 'Promo']).index.map(group_store)
-            )
-
-            # Month_Avg_Sales
-            group_month = fold_train.groupby('Month')['Sales_log'].mean()
-            train_df.loc[train_df.index[val_idx], 'Month_Avg_Sales'] = (
-                fold_val['Month'].map(group_month)
-            )
-    else:
-        logger.warning("Not enough rows for KFold target encoding. Falling back to global mean fill.")
-
-    # 2. TÍNH MAPPING TRÊN FULL TRAIN (Dành cho Val và Test sau này)
-    store_dw_promo_avg_map = (
-        train_df.groupby(["Store", "DayOfWeek", "Promo"])["Sales_log"].mean().reset_index()
-    )
-    store_dw_promo_avg_map.rename(columns={"Sales_log": "Store_DW_Promo_Avg"}, inplace=True)
-
-    month_avg_map = train_df.groupby("Month")["Sales_log"].mean().reset_index()
-    month_avg_map.rename(columns={"Sales_log": "Month_Avg_Sales"}, inplace=True)
-
-    # 3. MERGE SANG VAL_SET
-    val_df = val_df.merge(store_dw_promo_avg_map, on=["Store", "DayOfWeek", "Promo"], how="left")
-    val_df = val_df.merge(month_avg_map, on="Month", how="left")
-
-    # 4. FILL NaN VỚI GLOBAL MEAN
-    global_mean_train = float(train_df["Sales_log"].mean())
-
-    cols_to_fill = ["Store_DW_Promo_Avg", "Month_Avg_Sales"]
-    train_df[cols_to_fill] = train_df[cols_to_fill].fillna(global_mean_train)
-    val_df[cols_to_fill] = val_df[cols_to_fill].fillna(global_mean_train)
-
-    # ------------------------------------------------------------------ #
-    # PHẦN 2: ADVANCED FEATURE ENGINEERING (theo Cell 12 của notebook)    #
-    #   - Store_Avg_Sales  : median doanh thu theo Store                  #
-    #   - Store_DoW_Median : median doanh thu theo Store + DayOfWeek      #
-    #   - Promo_Lift       : tỉ lệ hiệu quả khuyến mãi theo Store        #
-    #   - Cyclical features: day_sin/cos, week_sin/cos                    #
-    # ------------------------------------------------------------------ #
-
-    logger.info("Computing advanced feature engineering (Store stats, Promo Lift, Cyclical features)")
-
-    # Chỉ tính trên train_df (dùng Sales gốc, không phải Sales_log)
-    if "Sales" not in train_df.columns:
-        raise TrainingError("Column 'Sales' is required for advanced feature engineering (Promo_Lift, Store_Avg_Sales)")
-
-    # A. Store Median
-    store_median: dict = train_df.groupby("Store")["Sales"].median().to_dict()
-
-    # B. Store + DayOfWeek Median
-    store_dow_stats = (
-        train_df.groupby(["Store", "DayOfWeek"])["Sales"]
-        .median()
-        .reset_index()
-        .rename(columns={"Sales": "Store_DoW_Median"})
-    )
-
-    # C. Promo Lift (median Sales khi có/không có Promo, theo từng Store)
-    promo_pivot = train_df.groupby(["Store", "Promo"])["Sales"].median().unstack()
-    promo_pivot["Promo_Lift"] = promo_pivot.get(1, pd.Series(dtype=float)) / (
-        promo_pivot.get(0, pd.Series(dtype=float)) + 1e-5
-    )
-    promo_lift_dict: dict = promo_pivot["Promo_Lift"].to_dict()
-
-    global_sales_median = float(train_df["Sales"].median())
-
-    def _apply_advanced_fe(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-
-        # Map store-level statistics
-        df["Store_Avg_Sales"] = df["Store"].map(store_median)
-        df["Promo_Lift"] = df["Store"].map(promo_lift_dict)
-        df = df.merge(store_dow_stats, on=["Store", "DayOfWeek"], how="left")
-
-        # Cyclical encoding
-        df["day_sin"] = np.sin(2 * np.pi * df["DayOfWeek"] / 7)
-        df["day_cos"] = np.cos(2 * np.pi * df["DayOfWeek"] / 7)
-        df["week_sin"] = np.sin(2 * np.pi * df["WeekOfYear"] / 52)
-        df["week_cos"] = np.cos(2 * np.pi * df["WeekOfYear"] / 52)
-
-        # Fill NaN cho store mới hoặc mapping lỗi
-        df["Store_Avg_Sales"] = df["Store_Avg_Sales"].fillna(global_sales_median)
-        df["Store_DoW_Median"] = df["Store_DoW_Median"].fillna(df["Store_Avg_Sales"])
-        df["Promo_Lift"] = df["Promo_Lift"].fillna(1.0)
-
-        return df
-
-    train_df = _apply_advanced_fe(train_df)
-    val_df = _apply_advanced_fe(val_df)
-
-    return (
-        train_df,
-        val_df,
-        store_dw_promo_avg_map,
-        month_avg_map,
-        global_mean_train,
-        store_median,
-        store_dow_stats,
-        promo_lift_dict,
-    )
-
-
-def _load_training_data(paths: dict[str, Any]) -> pd.DataFrame:
-    train_path = resolve_path(paths["train_data"])
+def _load_processed_data(
+    paths: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load preprocessed train_final and val_final datasets.
+    These files are expected to already have all preprocessing and feature engineering applied.
+    """
+    train_path = resolve_path(paths.get("train_final_data", "data/processed/train_final.csv"))
+    val_path = resolve_path(paths.get("val_final_data", "data/processed/val_final.csv"))
 
     if not train_path.exists():
-        raise FileNotFoundError(f"Training data not found: {train_path}")
+        raise FileNotFoundError(f"Preprocessed training data not found: {train_path}")
+    if not val_path.exists():
+        raise FileNotFoundError(f"Preprocessed validation data not found: {val_path}")
 
-    return pd.read_csv(train_path)
+    train_df = pd.read_csv(train_path)
+    val_df = pd.read_csv(val_path)
 
+    logger.info(f"Loaded training data: {len(train_df)} rows from {train_path}")
+    logger.info(f"Loaded validation data: {len(val_df)} rows from {val_path}")
 
-def _split_train_validation(df: pd.DataFrame, training: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    split_year = int(training.get("validation_year", 2015))
-    split_week = int(training.get("validation_week_min", 26))
-
-    if {"Year", "WeekOfYear"}.issubset(df.columns):
-        mask = (df["Year"] == split_year) & (df["WeekOfYear"] >= split_week)
-        if mask.any() and (~mask).any():
-            return df.loc[~mask].copy(), df.loc[mask].copy()
-
-    if "Date" in df.columns:
-        validation_start_date = training.get("validation_start_date", "2015-06-01")
-        start = pd.to_datetime(validation_start_date, errors="coerce")
-        parsed = pd.to_datetime(df["Date"], errors="coerce")
-        if pd.notna(start):
-            mask = parsed >= start
-            if mask.any() and (~mask).any():
-                return df.loc[~mask].copy(), df.loc[mask].copy()
-
-    if len(df) < 2:
-        raise TrainingError("Training data must contain at least 2 rows")
-
-    split_index = max(1, int(len(df) * 0.8))
-    if split_index >= len(df):
-        split_index = len(df) - 1
-    return df.iloc[:split_index].copy(), df.iloc[split_index:].copy()
-
-
-def _resolve_artifacts_dir(paths: dict[str, Any], model_path: Path) -> Path:
-    artifacts_dir = paths.get("artifacts_dir")
-    if artifacts_dir:
-        return resolve_path(artifacts_dir)
-    return model_path.parent
-
-
-def _is_missing_value(value: Any) -> bool:
-    if value is None:
-        return True
-    try:
-        return bool(pd.isna(value))
-    except Exception:
-        return False
-
-
-def _compact_model_params(params: dict[str, Any]) -> dict[str, Any]:
-    compact: dict[str, Any] = {}
-    for key, value in params.items():
-        if _is_missing_value(value):
-            continue
-        if isinstance(value, (np.generic,)):
-            compact[key] = value.item()
-        else:
-            compact[key] = value
-    return compact
+    return train_df, val_df
 
 
 def _prepare_xgb_inputs(x_train: pd.DataFrame, x_val: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -319,24 +77,65 @@ def _prepare_xgb_inputs(x_train: pd.DataFrame, x_val: pd.DataFrame) -> tuple[pd.
     return prepared_train, prepared_val
 
 
-def _resolve_model_config_output_path(
-    *,
-    paths: dict[str, Any],
-    training: dict[str, Any],
-    artifacts_dir: Path,
-    default_model_config_path: Path,
-) -> tuple[Path, bool]:
-    is_production_train = bool(training.get("production_train", False))
-    if is_production_train:
-        return default_model_config_path, True
+def _compact_model_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Convert model parameters to JSON-serializable format."""
+    compact: dict[str, Any] = {}
+    for key, value in params.items():
+        if value is None:
+            continue
+        try:
+            if pd.isna(value):
+                continue
+        except Exception:
+            pass
+        if isinstance(value, (np.generic,)):
+            compact[key] = value.item()
+        else:
+            compact[key] = value
+    return compact
 
-    candidate_override = paths.get("model_config_candidate_file")
-    if candidate_override:
-        return resolve_path(candidate_override), False
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    return artifacts_dir / f"model_config_candidate_{timestamp}.yaml", False
+def _resolve_artifacts_dir(paths: dict[str, Any], model_path: Path) -> Path:
+    """Resolve the artifacts directory path."""
+    artifacts_dir = paths.get("artifacts_dir")
+    if artifacts_dir:
+        return resolve_path(artifacts_dir)
+    return model_path.parent
 
+
+def _save_feature_mappings(train_df: pd.DataFrame, artifacts_dir: Path) -> None:
+    """
+    Save feature engineering mappings from preprocessed training data.
+    These will be used later for prediction on new data.
+    """
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Global mean sales (for imputation of unseen values)
+    global_mean = float(train_df["Sales_log"].mean())
+    joblib.dump(global_mean, artifacts_dir / "global_mean_sales.pkl")
+    logger.info(f"Saved global_mean_sales: {global_mean}")
+
+    # Store + DayOfWeek + Promo average
+    if {"Store", "DayOfWeek", "Promo", "Sales_log"}.issubset(train_df.columns):
+        store_dw_promo_avg_map = (
+            train_df.groupby(["Store", "DayOfWeek", "Promo"])["Sales_log"]
+            .mean()
+            .reset_index()
+            .rename(columns={"Sales_log": "Store_DW_Promo_Avg"})
+        )
+        joblib.dump(store_dw_promo_avg_map, artifacts_dir / "store_dw_promo_mapping.pkl")
+        logger.info("Saved store_dw_promo_mapping")
+
+    # Month average
+    if {"Month", "Sales_log"}.issubset(train_df.columns):
+        month_avg_map = (
+            train_df.groupby("Month")["Sales_log"]
+            .mean()
+            .reset_index()
+            .rename(columns={"Sales_log": "Month_Avg_Sales"})
+        )
+        joblib.dump(month_avg_map, artifacts_dir / "month_mapping.pkl")
+        logger.info("Saved month_mapping")
 
 def _log_mlflow_payload(
     mlflow_cfg: dict[str, Any],
@@ -344,6 +143,7 @@ def _log_mlflow_payload(
     metrics: dict[str, float],
     run_name: str,
 ) -> None:
+    """Log model training results to MLflow."""
     if not bool(mlflow_cfg.get("enabled", False)):
         return
 
@@ -358,52 +158,61 @@ def _log_mlflow_payload(
             for metric_name, metric_value in metrics.items():
                 mlflow.log_metric(metric_name, float(metric_value))
             mlflow.sklearn.log_model(model, "model")
+        logger.info("MLflow logging completed successfully")
     except Exception as exc:  # pragma: no cover
         logger.warning("Skipping MLflow logging due to error: %s", exc)
 
 
 def train_pipeline(config: dict[str, Any]) -> dict[str, Any]:
+    """
+    Train XGBoost model on preprocessed data.
+    
+    Args:
+        config: Configuration dictionary with paths, training hyperparameters, and mlflow settings
+    
+    Returns:
+        Dictionary with model path, metrics, and training statistics
+    """
     paths = config.get("paths", {})
     training = config.get("training", {})
     mlflow_cfg = config.get("mlflow", {})
 
+    # Load preprocessed data
+    train_df, val_df = _load_processed_data(paths)
+
+    # Prepare output paths
     model_path = resolve_path(paths["model_file"])
     metrics_path = resolve_path(paths["metrics_file"])
     artifacts_dir = _resolve_artifacts_dir(paths, model_path)
     default_model_config_path = resolve_path(paths.get("model_config_file", "configs/model_config.yaml"))
 
-    raw_df = _load_training_data(paths)
-    prepared_df = _prepare_training_columns(raw_df)
-    if len(prepared_df) < 2:
-        raise TrainingError("Training data must contain at least 2 valid rows after preprocessing")
+    # Verify data has required target column
+    if "Sales_log" not in train_df.columns or "Sales_log" not in val_df.columns:
+        raise TrainingError("Preprocessed data must contain 'Sales_log' column (target variable)")
 
-    train_df, val_df = _split_train_validation(prepared_df, training)
-    if len(train_df) == 0 or len(val_df) == 0:
-        raise TrainingError("Unable to create a valid train/validation split")
+    logger.info(f"Train set shape: {train_df.shape}")
+    logger.info(f"Validation set shape: {val_df.shape}")
 
-    (
-        train_df,
-        val_df,
-        store_dw_promo_mapping,
-        month_mapping,
-        global_mean,
-        store_median_mapping,
-        store_dow_stats_mapping,
-        promo_lift_mapping,
-    ) = apply_feature_engineering(train_df, val_df)
-
-    # Notebook cell 13: drop_cols = ['Sales', 'Sales_log', 'Customers']
-    # Promo2 / Date / Id are dropped defensively; Month is KEPT as a feature
-    drop_cols = ["Sales", "Sales_log", "Customers", "Promo2", "Date", "Id"]
+    # Prepare features and target
+    # Drop non-feature columns (target and identifiers)
+    drop_cols = ["Sales", "Sales_log", "Customers", "Date", "Id"]
     x_train = train_df.drop(columns=drop_cols, errors="ignore")
     x_val = val_df.drop(columns=drop_cols, errors="ignore")
+
+    # Ensure consistent data types
     x_train, x_val = _prepare_xgb_inputs(x_train, x_val)
 
-    y_train = train_df["Sales_log"].astype(float)
-    y_val = val_df["Sales_log"].astype(float)
-    y_train_true = np.exp(y_train)
-    y_val_true = np.exp(y_val)
+    # Get target variables
+    y_train_log = train_df["Sales_log"].astype(float)
+    y_val_log = val_df["Sales_log"].astype(float)
+    
+    # Convert from log space to original scale for RMSPE calculation
+    y_train_true = np.exp(y_train_log)
+    y_val_true = np.exp(y_val_log)
 
+    logger.info(f"Features for training: {list(x_train.columns)}")
+
+    # Initialize and train model with hyperparameters from config
     model = xgb.XGBRegressor(
         objective="reg:squarederror",
         tree_method=training.get("tree_method", "hist"),
@@ -419,11 +228,14 @@ def train_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     )
 
     logger.info("Training XGBoost model")
-    model.fit(x_train, y_train)
+    model.fit(x_train, y_train_log)
+    logger.info("Model training completed")
 
+    # Generate predictions
     y_train_pred = np.exp(model.predict(x_train))
     y_val_pred = np.exp(model.predict(x_val))
 
+    # Calculate metrics
     train_rmspe = rmspe(y_train_true, y_train_pred)
     val_rmspe = rmspe(y_val_true, y_val_pred)
     rmspe_gap = float(val_rmspe - train_rmspe)
@@ -440,30 +252,29 @@ def train_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         "r2": r2,
     }
 
+    logger.info(f"Training metrics: {metrics}")
+
+    # Log to MLflow
     _log_mlflow_payload(mlflow_cfg, model, metrics, run_name=training.get("run_name", "Production_Train_Logic"))
 
+    # Create output directories
     model_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    model_params = _compact_model_params(model.get_params())
-    model_config_path, config_overwritten = _resolve_model_config_output_path(
-        paths=paths,
-        training=training,
-        artifacts_dir=artifacts_dir,
-        default_model_config_path=default_model_config_path,
-    )
-    model_config_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Save model
     joblib.dump(model, model_path)
-    joblib.dump(store_dw_promo_mapping, artifacts_dir / "store_dw_promo_mapping.pkl")
-    joblib.dump(month_mapping, artifacts_dir / "month_mapping.pkl")
-    joblib.dump(global_mean, artifacts_dir / "global_mean_sales.pkl")
-    joblib.dump(store_median_mapping, artifacts_dir / "store_median_mapping.pkl")
-    joblib.dump(store_dow_stats_mapping, artifacts_dir / "store_dow_stats_mapping.pkl")
-    joblib.dump(promo_lift_mapping, artifacts_dir / "promo_lift_mapping.pkl")
+    logger.info(f"Model saved to: {model_path}")
 
+    # Save feature engineering mappings for later use in prediction
+    _save_feature_mappings(train_df, artifacts_dir)
+
+    # Save metrics
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    logger.info(f"Metrics saved to: {metrics_path}")
 
+    # Prepare and save model configuration
+    model_params = _compact_model_params(model.get_params())
     model_config_payload = {
         "project": "Rossmann Store Sales",
         "best_model": {
@@ -476,7 +287,11 @@ def train_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             "target": "Sales_log",
         },
     }
+
+    model_config_path = default_model_config_path
+    model_config_path.parent.mkdir(parents=True, exist_ok=True)
     model_config_path.write_text(yaml.safe_dump(model_config_payload, sort_keys=False), encoding="utf-8")
+    logger.info(f"Model config saved to: {model_config_path}")
 
     return {
         "model_path": str(model_path),
@@ -486,12 +301,12 @@ def train_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         "metrics": metrics,
         "n_train": int(len(x_train)),
         "n_validation": int(len(x_val)),
-        "model_config_overwritten": config_overwritten,
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train Rossmann model from YAML config")
+    """Main entry point for training pipeline."""
+    parser = argparse.ArgumentParser(description="Train Rossmann model from preprocessed data")
     parser.add_argument("--config", default="configs/config.yaml", help="Path to YAML config")
     args = parser.parse_args()
 

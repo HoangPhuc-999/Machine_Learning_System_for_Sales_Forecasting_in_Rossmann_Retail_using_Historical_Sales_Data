@@ -1,10 +1,10 @@
 paths:
-  train_data: data/raw/train.csv
+  train_final_data: data/processed/train_final.csv
+  val_final_data: data/processed/val_final.csv
   store_data: data/raw/store.csv
   model_file: artifacts/models/rossmann_model.joblib
   metrics_file: artifacts/metrics/metrics.json
   model_config_file: configs/model_config.yaml
-  model_config_candidate_file: artifacts/models/model_config_candidate.yaml
 
 training:
   production_train: false
